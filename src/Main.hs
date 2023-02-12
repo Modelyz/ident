@@ -11,22 +11,19 @@ import qualified Network.WebSockets as WS
 import Options.Applicative
 
 -- dir, port, file
-data Options = Options !String !Port !FilePath
+data Options = Options !FilePath !Host !Port
 
+type Host = String
 type Port = Int
 
 type SeqMV = CC.MVar (Map.Map String Int)
 
-portOption :: Parser Port
-portOption =
-    option auto (long "port" <> short 'p' <> metavar "PORT" <> value 8081 <> help "Port of the Store service.  [default: 8081]")
-
 options :: Parser Options
 options =
     Options
-        <$> strOption (short 'd' <> long "dir" <> value "." <> help "Directory containing the index file and static directory")
-        <*> portOption
-        <*> strOption (short 'f' <> long "file" <> value "messagestore.txt" <> help "Filename of the file containing messages")
+        <$> strOption (short 'f' <> long "file" <> value "messagestore.txt" <> help "Filename of the file containing messages")
+        <*> strOption (short 'h' <> long "store_host" <> value "localhost" <> help "Hostname of the Store service. [default: localhost]")
+        <*> option auto (long "store_port" <> metavar "STORE_PORT" <> value 8081 <> help "Port of the Store service.  [default: 8081]")
 
 clientApp :: FilePath -> SeqMV -> WS.ClientApp ()
 clientApp f seqMV conn = do
@@ -79,10 +76,10 @@ handleMessage f conn seqMV ev = do
         putStrLn $ "\nSent ev' through WS: " ++ show ev'
 
 serve :: Options -> IO ()
-serve (Options _ p f) = do
+serve (Options f h p) = do
     seqMV <- CC.newMVar Map.empty
-    putStrLn $ "Connecting to Store at ws://localhost:" ++ show p ++ "/"
-    WS.runClient "localhost" p "/" (clientApp f seqMV) -- TODO auto-reconnect
+    putStrLn $ "Connecting to Store at ws://" ++ h ++ ":" ++ show p ++ "/"
+    WS.runClient h p "/" (clientApp f seqMV) -- TODO auto-reconnect
 
 main :: IO ()
 main =
