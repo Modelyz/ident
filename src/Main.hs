@@ -5,8 +5,8 @@ import Control.Monad (forever, when)
 import qualified Data.Aeson as JSON (decode, encode)
 import qualified Data.Map.Strict as Map
 import qualified Data.Maybe as Maybe
-import Message (Fragment (..), Message, getFragments, isProcessed, isType, setFragments, setProcessed)
-import qualified MessageStore as ES
+import Ident.Fragment (Fragment (..), getFragments, setFragments)
+import Message (Message, appendMessage, isProcessed, isType, setFlow)
 import qualified Network.WebSockets as WS
 import Options.Applicative
 
@@ -47,7 +47,7 @@ handleMessage :: FilePath -> WS.Connection -> SeqMV -> Message -> IO ()
 handleMessage f conn seqMV ev = do
     when (isType "AddedIdentifier" ev && not (isProcessed ev)) $ do
         -- store the ident messages in the local store
-        ES.appendMessage f ev
+        appendMessage f ev
         putStrLn $ "\nStored message: " ++ show ev
         -- read the fragments
         let fragments = getFragments ev
@@ -67,11 +67,11 @@ handleMessage f conn seqMV ev = do
         CC.putMVar seqMV $! newseqMap
         -- build an ev' with the computed sequences.
         -- We need to loop on the fragment and update those whose with the right name
-        let ev' = setProcessed $ setFragments (reverse fragments') ev
+        let ev' = setFlow "Processed" $ setFragments (reverse fragments') ev
         putStrLn $ "\nfragments: " ++ show fragments'
         -- Store and send back an ACK to let the client know the message has been processed
         -- except for messages that already have an ACK
-        ES.appendMessage f ev'
+        appendMessage f ev'
         WS.sendTextData conn $ JSON.encode [ev']
         putStrLn $ "\nSent ev' through WS: " ++ show ev'
 
