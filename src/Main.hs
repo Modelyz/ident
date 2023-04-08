@@ -30,7 +30,7 @@ options =
         <$> strOption
             ( short 'f'
                 <> long "file"
-                <> value "messagestore.txt"
+                <> value "data/messagestore.txt"
                 <> help "Filename of the file containing messages"
             )
         <*> strOption
