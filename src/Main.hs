@@ -11,7 +11,7 @@ import Data.Text qualified as T
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
 import Data.Traversable qualified as Traversable (sequence)
 import Ident.Fragment (Fragment (..))
-import Message (Message, appendMessage, getFragments, isProcessed, isType, setFlow, setFragments)
+import Message (Message, appendMessage, getFragments, isProcessed, isType, setCreator, setFlow, setFragments)
 import MessageFlow (MessageFlow (..))
 import Network.WebSockets qualified as WS
 import Options.Applicative qualified as Options
@@ -94,7 +94,7 @@ handleMessage f conn stateMV ev = do
         putStrLn $ "\nnewseqMap = " ++ show newState
         -- build an ev' with the computed sequences.
         -- We need to loop on the fragment and update those whose with the right name
-        let ev' = setFlow Processed $ setFragments (reverse fragments') ev
+        let ev' = setFlow Processed $ setFragments (reverse fragments') $ setCreator "ident" ev
         putStrLn $ "\nfragments: " ++ show fragments'
         -- Store and send back an ACK to let the client know the message has been processed
         -- except for messages that already have an ACK
