@@ -1,3 +1,3 @@
 #!/bin/bash
 
-cabal run ident -- -f ./messagestore.txt
+cabal run ident -- -f ./data/messagestore.txt

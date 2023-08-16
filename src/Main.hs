@@ -2,8 +2,8 @@
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent qualified as CC
-import Control.Exception (SomeException (SomeException), catch)
-import Control.Monad qualified as Monad (forever, when)
+import Control.Exception (AsyncException (..), Handler (..), SomeException (..), catches)
+import Control.Monad qualified as Monad (forever, unless)
 import Data.Aeson qualified as JSON (decode, encode)
 import Data.Map.Strict qualified as Map
 import Data.Maybe qualified as Maybe
@@ -11,10 +11,11 @@ import Data.Text qualified as T
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
 import Data.Traversable qualified as Traversable (sequence)
 import Ident.Fragment (Fragment (..))
-import Message (Message, appendMessage, getFragments, isProcessed, isType, setCreator, setFlow, setFragments)
+import Message (Message, Payload (..), appendMessage, getFragments, isProcessed, payload, setCreator, setFlow, setFragments)
 import MessageFlow (MessageFlow (..))
-import Network.WebSockets qualified as WS
+import Network.WebSockets qualified as WS (ClientApp, Connection, DataMessage (..), fromLazyByteString, receiveDataMessage, runClient, sendTextData)
 import Options.Applicative qualified as Options
+import System.Exit (exitSuccess)
 
 -- dir, port, file
 data Options = Options !FilePath !Host !Port
@@ -71,36 +72,56 @@ clientApp f stateMV conn = do
             Nothing -> Traversable.sequence [putStrLn "\nError decoding incoming message"]
 
 handleMessage :: FilePath -> WS.Connection -> StateMV -> Message -> IO ()
-handleMessage f conn stateMV ev = do
-    Monad.when (ev `isType` "AddedIdentifier" && not (isProcessed ev)) $ do
-        -- store the ident messages in the local store
-        appendMessage f ev
-        putStrLn $ "\nStored message: " ++ show ev
-        -- read the fragments
-        let fragments = getFragments ev
-        print fragments
-        state <- CC.takeMVar stateMV
-        let (fragments', newState) =
-                foldl
-                    ( \(frags, st) fragment -> case fragment of
-                        Sequence name padding step start _ ->
-                            let newseq = step + Maybe.fromMaybe start (Map.lookup name (lastNumbers st))
-                             in (Sequence name padding step start (Just newseq) : frags, (st{lastNumbers = Map.insert name newseq (lastNumbers st)}))
-                        fr -> (fr : frags, st)
-                    )
-                    ([], state)
-                    fragments
-        CC.putMVar stateMV $! newState
-        putStrLn $ "\nnewseqMap = " ++ show newState
-        -- build an ev' with the computed sequences.
-        -- We need to loop on the fragment and update those whose with the right name
-        let ev' = setFlow Processed $ setFragments (reverse fragments') $ setCreator "ident" ev
-        putStrLn $ "\nfragments: " ++ show fragments'
-        -- Store and send back an ACK to let the client know the message has been processed
-        -- except for messages that already have an ACK
-        appendMessage f ev'
-        WS.sendTextData conn $ JSON.encode [ev']
-        putStrLn $ "\nSent ev' through WS: " ++ show ev'
+handleMessage f conn stateMV msg = do
+    Monad.unless (isProcessed msg) $ do
+        case payload msg of
+            AddedIdentifier _ -> do
+                -- store the ident messages in the local store
+                appendMessage f msg
+                putStrLn $ "\nStored message: " ++ show msg
+                -- read the fragments
+                let fragments = getFragments msg
+                print fragments
+                state <- CC.takeMVar stateMV
+                let (fragments', newState) =
+                        foldl
+                            ( \(frags, st) fragment -> case fragment of
+                                Sequence name padding step start _ ->
+                                    let newseq = step + Maybe.fromMaybe start (Map.lookup name (lastNumbers st))
+                                     in (Sequence name padding step start (Just newseq) : frags, (st{lastNumbers = Map.insert name newseq (lastNumbers st)}))
+                                fr -> (fr : frags, st)
+                            )
+                            ([], state)
+                            fragments
+                CC.putMVar stateMV $! newState
+                putStrLn $ "\nnewseqMap = " ++ show newState
+                -- build an msg' with the computed sequences.
+                -- We need to loop on the fragment and update those whose with the right name
+                let msg' = setFlow Processed $ setFragments (reverse fragments') $ setCreator "ident" msg
+                putStrLn $ "\nfragments: " ++ show fragments'
+                -- Store and send back an ACK to let the client know the message has been processed
+                -- except for messages that already have an ACK
+                appendMessage f msg'
+                WS.sendTextData conn $ JSON.encode [msg']
+                putStrLn $ "\nSent msg' through WS: " ++ show msg'
+            AddedIdentifierType _ -> do
+                appendMessage f msg
+                processMessage f conn msg
+            RemovedIdentifierType _ -> do
+                appendMessage f msg
+                processMessage f conn msg
+            ChangedIdentifierType _ _ -> do
+                appendMessage f msg
+                processMessage f conn msg
+            _ -> putStrLn "Invalid message received. Not handling it."
+
+processMessage :: FilePath -> WS.Connection -> Message -> IO ()
+processMessage f conn msg = do
+    -- just set as Processed, store and send back
+    let msg' = setFlow Processed $ setCreator "ident" msg
+    appendMessage f msg'
+    WS.sendTextData conn $ JSON.encode [msg']
+    putStrLn $ "\nSent msg' through WS: " ++ show msg'
 
 maxWait :: Int
 maxWait = 10
@@ -108,22 +129,45 @@ maxWait = 10
 connectClient :: Int -> POSIXTime -> Host -> Port -> FilePath -> StateMV -> IO ()
 connectClient waitTime previousTime host port msgPath stateMV = do
     putStrLn $ "Waiting " ++ show waitTime ++ " seconds"
-
     threadDelay $ waitTime * 1000000
     putStrLn $ "Connecting to Store at ws://" ++ host ++ ":" ++ show port ++ "..."
-    catch
+
+    catches
         (WS.runClient host port "/" (clientApp msgPath stateMV))
-        ( \(SomeException _) -> do
-            disconnectTime <- getPOSIXTime
-            let newWaitTime = if fromEnum (disconnectTime - previousTime) >= (1000000000000 * (maxWait + 1)) then 1 else min maxWait $ waitTime + 1
-            connectClient newWaitTime disconnectTime host port msgPath stateMV
-        )
+        [ Handler
+            ( \(e :: AsyncException) -> case e of
+                UserInterrupt -> do
+                    putStrLn "Stopping..."
+                    exitSuccess
+                _ -> return ()
+            )
+        , Handler
+            ( \(_ :: SomeException) ->
+                do
+                    disconnectTime <- getPOSIXTime
+                    let newWaitTime = if fromEnum (disconnectTime - previousTime) >= (1000000000000 * (maxWait + 1)) then 1 else min maxWait $ waitTime + 1
+                    connectClient newWaitTime disconnectTime host port msgPath stateMV
+            )
+        ]
+
+{-( \(e :: AsyncException) -> case e of
+        UserInterrupt -> do
+            putStrLn "Stopping..."
+            exitSuccess
+        _ -> putStrLn "bop"
+    )
+)
+( do
+    putStrLn "plop"
+    disconnectTime <- getPOSIXTime
+    let newWaitTime = if fromEnum (disconnectTime - previousTime) >= (1000000000000 * (maxWait + 1)) then 1 else min maxWait $ waitTime + 1
+    connectClient newWaitTime disconnectTime host port msgPath stateMV
+)-}
 
 serve :: Options -> IO ()
 serve (Options msgPath storeHost storePort) = do
     stateMV <- CC.newMVar emptyState
     firstTime <- getPOSIXTime
-    putStrLn $ "Connecting to Store at ws://" ++ storeHost ++ ":" ++ show storePort ++ "/"
     connectClient 1 firstTime storeHost storePort msgPath stateMV
 
 main :: IO ()
