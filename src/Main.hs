@@ -9,7 +9,6 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe qualified as Maybe
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
-import Data.Traversable qualified as Traversable (sequence)
 import Ident.Fragment (Fragment (..))
 import Message (Message, Payload (..), appendMessage, getFragments, isProcessed, payload, setCreator, setFlow, setFragments)
 import MessageFlow (MessageFlow (..))
@@ -61,15 +60,15 @@ clientApp f stateMV conn = do
     -- loop on the handling of messages incoming through websocket
     putStrLn "Starting message handler"
     Monad.forever $ do
-        messages <- WS.receiveDataMessage conn
-        putStrLn $ "\nReceived string through websocket from store: " ++ show messages
+        msg <- WS.receiveDataMessage conn
+        putStrLn $ "\nReceived string through websocket from store: " ++ show msg
         case JSON.decode
-            ( case messages of
+            ( case msg of
                 WS.Text bs _ -> WS.fromLazyByteString bs
                 WS.Binary bs -> WS.fromLazyByteString bs
             ) of
-            Just evs -> mapM (handleMessage f conn stateMV) evs
-            Nothing -> Traversable.sequence [putStrLn "\nError decoding incoming message"]
+            Just ev -> handleMessage f conn stateMV ev
+            Nothing -> putStrLn "\nError decoding incoming message"
 
 handleMessage :: FilePath -> WS.Connection -> StateMV -> Message -> IO ()
 handleMessage f conn stateMV msg = do
@@ -102,7 +101,7 @@ handleMessage f conn stateMV msg = do
                 -- Store and send back an ACK to let the client know the message has been processed
                 -- except for messages that already have an ACK
                 appendMessage f msg'
-                WS.sendTextData conn $ JSON.encode [msg']
+                WS.sendTextData conn $ JSON.encode msg'
                 putStrLn $ "\nSent msg' through WS: " ++ show msg'
             AddedIdentifierType _ -> do
                 appendMessage f msg
@@ -120,7 +119,7 @@ processMessage f conn msg = do
     -- just set as Processed, store and send back
     let msg' = setFlow Processed $ setCreator "ident" msg
     appendMessage f msg'
-    WS.sendTextData conn $ JSON.encode [msg']
+    WS.sendTextData conn $ JSON.encode msg'
     putStrLn $ "\nSent msg' through WS: " ++ show msg'
 
 maxWait :: Int
