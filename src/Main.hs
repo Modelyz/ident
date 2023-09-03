@@ -1,18 +1,22 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-import Control.Concurrent (threadDelay)
-import Control.Concurrent qualified as CC
+import Connection (Connection (..))
+import Control.Concurrent (Chan, MVar, dupChan, forkIO, newChan, newMVar, putMVar, readChan, readMVar, takeMVar, threadDelay, writeChan)
 import Control.Exception (AsyncException (..), Handler (..), SomeException (..), catches)
-import Control.Monad qualified as Monad (forever, unless)
-import Data.Aeson qualified as JSON (decode, encode)
+import Control.Monad qualified as Monad (forever, when)
+import Data.Aeson qualified as JSON (eitherDecode, encode)
 import Data.Map.Strict qualified as Map
 import Data.Maybe qualified as Maybe
+import Data.Set as Set (Set, delete, empty, insert)
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
+import Data.UUID (UUID)
+import Data.UUID.V4 qualified as UUID (nextRandom)
 import Ident.Fragment (Fragment (..))
-import Message (Message, Payload (..), appendMessage, getFragments, isProcessed, payload, setCreator, setFlow, setFragments)
+import Message (Message (Message), Metadata (..), Payload (..), appendMessage, getFragments, metadata, payload, readMessages, setCreator, setFlow, setFragments)
 import MessageFlow (MessageFlow (..))
-import Network.WebSockets qualified as WS (ClientApp, Connection, DataMessage (..), fromLazyByteString, receiveDataMessage, runClient, sendTextData)
+import Network.WebSockets (ConnectionException (..))
+import Network.WebSockets qualified as WS (ClientApp, DataMessage (..), fromLazyByteString, receiveDataMessage, runClient, sendTextData)
 import Options.Applicative qualified as Options
 import System.Exit (exitSuccess)
 
@@ -22,12 +26,21 @@ data Options = Options !FilePath !Host !Port
 type Host = String
 type Port = Int
 
-newtype State = State {lastNumbers :: Map.Map T.Text Int}
+data State = State
+    { lastNumbers :: Map.Map T.Text Int -- last identification number for each fragment name
+    , pending :: Set Message
+    , uuids :: Set UUID
+    }
     deriving (Show)
-type StateMV = CC.MVar State
+type StateMV = MVar State
 
 emptyState :: State
-emptyState = State{lastNumbers = Map.empty}
+emptyState =
+    State
+        { lastNumbers = Map.empty
+        , pending = Set.empty
+        , Main.uuids = Set.empty
+        }
 
 options :: Options.Parser Options
 options =
@@ -52,88 +65,129 @@ options =
                 <> Options.help "Port of the Store service.  [default: 8081]"
             )
 
-clientApp :: FilePath -> StateMV -> WS.ClientApp ()
-clientApp f stateMV conn = do
+clientApp :: FilePath -> Chan Message -> StateMV -> WS.ClientApp ()
+clientApp msgPath storeChan stateMV conn = do
     putStrLn "Connected!"
-    -- TODO: Use the Flow to determine if it has been received by the store, in case the store was not alive.
-    --
+    -- Just reconnected, first send an InitiatedConnection to the store
+    newUuid <- UUID.nextRandom
+    currentTime <- getPOSIXTime
+    state <- readMVar stateMV
+    -- send an initiatedConnection
+    let initiatedConnection =
+            Message
+                (Metadata{uuid = newUuid, Message.when = currentTime, from = "ident", flow = Requested})
+                (InitiatedConnection (Connection{lastMessageTime = 0, Connection.uuids = Main.uuids state}))
+    _ <- WS.sendTextData conn $ JSON.encode initiatedConnection
+    -- Just reconnected, send the pending messages to the Store
+    mapM_ (WS.sendTextData conn . JSON.encode) (pending state)
+    _ <- forkIO $ do
+        putStrLn "Waiting for messages coming from the Store"
+        Monad.forever $ do
+            msg <- readChan storeChan -- here we get all messages from all browsers
+            Monad.when (from (metadata msg) == "front") $ do
+                case flow (metadata msg) of
+                    Requested -> do
+                        putStrLn $ "\nProcessing this msg coming from browser: " ++ show msg
+                        st <- takeMVar stateMV
+                        -- process
+                        processedMsg <- processMessage stateMV msg
+                        putMVar stateMV $! update st msg
+                        -- send to the Store
+                        WS.sendTextData conn $ JSON.encode processedMsg
+                    _ -> return ()
+
+    -- CLIENT MAIN THREAD
     -- loop on the handling of messages incoming through websocket
     putStrLn "Starting message handler"
     Monad.forever $ do
-        msg <- WS.receiveDataMessage conn
-        putStrLn $ "\nReceived string through websocket from store: " ++ show msg
-        case JSON.decode
-            ( case msg of
+        message <- WS.receiveDataMessage conn
+        putStrLn $ "\nReceived msg through websocket from the store: " ++ show message
+        case JSON.eitherDecode
+            ( case message of
                 WS.Text bs _ -> WS.fromLazyByteString bs
                 WS.Binary bs -> WS.fromLazyByteString bs
             ) of
-            Just ev -> handleMessage f conn stateMV ev
-            Nothing -> putStrLn "\nError decoding incoming message"
+            Right msg -> do
+                case flow (metadata msg) of
+                    Requested -> do
+                        st' <- readMVar stateMV
+                        Monad.when (from (metadata msg) == "front" && uuid (metadata msg) `notElem` Main.uuids st') $ do
+                            appendMessage msgPath msg
+                            -- send msg to other connected clients
+                            putStrLn "\nWriting to the chan"
+                            writeChan storeChan msg
+                            -- Add it or remove to the pending list (if relevant) and keep the uuid
+                            st'' <- takeMVar stateMV
+                            putMVar stateMV $! update st'' msg
+                            putStrLn "updated state"
+                    _ -> return ()
 
-handleMessage :: FilePath -> WS.Connection -> StateMV -> Message -> IO ()
-handleMessage f conn stateMV msg = do
-    Monad.unless (isProcessed msg) $ do
-        case payload msg of
-            AddedIdentifier _ -> do
-                -- store the ident messages in the local store
-                appendMessage f msg
-                putStrLn $ "\nStored message: " ++ show msg
-                -- read the fragments
-                let fragments = getFragments msg
-                print fragments
-                state <- CC.takeMVar stateMV
-                let (fragments', newState) =
-                        foldl
-                            ( \(frags, st) fragment -> case fragment of
-                                Sequence name padding step start _ ->
-                                    let newseq = step + Maybe.fromMaybe start (Map.lookup name (lastNumbers st))
-                                     in (Sequence name padding step start (Just newseq) : frags, (st{lastNumbers = Map.insert name newseq (lastNumbers st)}))
-                                fr -> (fr : frags, st)
-                            )
-                            ([], state)
-                            fragments
-                CC.putMVar stateMV $! newState
-                putStrLn $ "\nnewseqMap = " ++ show newState
-                -- build an msg' with the computed sequences.
-                -- We need to loop on the fragment and update those whose with the right name
-                let msg' = setFlow Processed $ setFragments (reverse fragments') $ setCreator "ident" msg
-                putStrLn $ "\nfragments: " ++ show fragments'
-                -- Store and send back an ACK to let the client know the message has been processed
-                -- except for messages that already have an ACK
-                appendMessage f msg'
-                WS.sendTextData conn $ JSON.encode msg'
-                putStrLn $ "\nSent msg' through WS: " ++ show msg'
-            AddedIdentifierType _ -> do
-                appendMessage f msg
-                processMessage f conn msg
-            RemovedIdentifierType _ -> do
-                appendMessage f msg
-                processMessage f conn msg
-            ChangedIdentifierType _ _ -> do
-                appendMessage f msg
-                processMessage f conn msg
-            _ -> putStrLn "Invalid message received. Not handling it."
+                processedMsg <- processMessage stateMV msg
+                state' <- takeMVar stateMV
+                putMVar stateMV $! foldl update state' processedMsg
+            Left err -> putStrLn $ "\nError decoding incoming message" ++ err
 
-processMessage :: FilePath -> WS.Connection -> Message -> IO ()
-processMessage f conn msg = do
-    -- just set as Processed, store and send back
-    let msg' = setFlow Processed $ setCreator "ident" msg
-    appendMessage f msg'
-    WS.sendTextData conn $ JSON.encode msg'
-    putStrLn $ "\nSent msg' through WS: " ++ show msg'
+update :: State -> Message -> State
+update state msg =
+    case flow (metadata msg) of
+        Requested -> case payload msg of
+            InitiatedConnection _ -> state
+            _ ->
+                state
+                    { pending = Set.insert msg $ pending state
+                    , Main.uuids = Set.insert (uuid (metadata msg)) (Main.uuids state)
+                    }
+        Processed -> state{pending = Set.delete msg $ pending state}
+        Error _ -> state
+
+processMessage :: StateMV -> Message -> IO [Message]
+processMessage stateMV msg = do
+    case payload msg of
+        AddedIdentifier _ -> do
+            -- store the ident messages in the local store
+            putStrLn $ "\nStored message: " ++ show msg
+            state <- takeMVar stateMV
+            -- read the fragments
+            let fragments = getFragments msg
+            print fragments
+            let (fragments', newState) =
+                    foldl
+                        ( \(frags, st) fragment -> case fragment of
+                            Sequence name padding step start _ ->
+                                let newseq = step + Maybe.fromMaybe start (Map.lookup name (lastNumbers st))
+                                 in (Sequence name padding step start (Just newseq) : frags, (st{lastNumbers = Map.insert name newseq (lastNumbers st)}))
+                            fr -> (fr : frags, st)
+                        )
+                        ([], state)
+                        fragments
+            putMVar stateMV $! update newState msg
+            putStrLn $ "\nnewseqMap = " ++ show newState
+            -- build a ProcessedMsg with the computed sequences.
+            -- We need to loop on the fragment and update those whose with the right name
+            state' <- takeMVar stateMV
+            let processedMsg = setFlow Processed $ setFragments (reverse fragments') $ setCreator "ident" msg
+            putMVar stateMV $! update state' processedMsg
+            putStrLn $ "\nfragments: " ++ show fragments'
+            return [processedMsg]
+        AddedIdentifierType _ -> return [setFlow Processed $ setCreator "ident" msg]
+        RemovedIdentifierType _ -> return [setFlow Processed $ setCreator "ident" msg]
+        ChangedIdentifierType _ _ -> return [setFlow Processed $ setCreator "ident" msg]
+        _ -> return []
 
 maxWait :: Int
 maxWait = 10
 
-connectClient :: Int -> POSIXTime -> Host -> Port -> FilePath -> StateMV -> IO ()
-connectClient waitTime previousTime host port msgPath stateMV = do
+reconnectClient :: Int -> POSIXTime -> Host -> Port -> FilePath -> Chan Message -> StateMV -> IO ()
+reconnectClient waitTime previousTime host port msgPath storeChan stateMV = do
     putStrLn $ "Waiting " ++ show waitTime ++ " seconds"
     threadDelay $ waitTime * 1000000
     putStrLn $ "Connecting to Store at ws://" ++ host ++ ":" ++ show port ++ "..."
 
     catches
-        (WS.runClient host port "/" (clientApp msgPath stateMV))
+        (WS.runClient host port "/" (clientApp msgPath storeChan stateMV))
         [ Handler
+            (\(_ :: ConnectionException) -> reconnectClient 1 previousTime host port msgPath storeChan stateMV)
+        , Handler
             ( \(e :: AsyncException) -> case e of
                 UserInterrupt -> do
                     putStrLn "Stopping..."
@@ -145,29 +199,25 @@ connectClient waitTime previousTime host port msgPath stateMV = do
                 do
                     disconnectTime <- getPOSIXTime
                     let newWaitTime = if fromEnum (disconnectTime - previousTime) >= (1000000000000 * (maxWait + 1)) then 1 else min maxWait $ waitTime + 1
-                    connectClient newWaitTime disconnectTime host port msgPath stateMV
+                    reconnectClient newWaitTime disconnectTime host port msgPath storeChan stateMV
             )
         ]
 
-{-( \(e :: AsyncException) -> case e of
-        UserInterrupt -> do
-            putStrLn "Stopping..."
-            exitSuccess
-        _ -> putStrLn "bop"
-    )
-)
-( do
-    putStrLn "plop"
-    disconnectTime <- getPOSIXTime
-    let newWaitTime = if fromEnum (disconnectTime - previousTime) >= (1000000000000 * (maxWait + 1)) then 1 else min maxWait $ waitTime + 1
-    connectClient newWaitTime disconnectTime host port msgPath stateMV
-)-}
-
 serve :: Options -> IO ()
 serve (Options msgPath storeHost storePort) = do
-    stateMV <- CC.newMVar emptyState
+    chan <- newChan -- main channel, that will be duplicated for the store
+    stateMV <- newMVar emptyState
     firstTime <- getPOSIXTime
-    connectClient 1 firstTime storeHost storePort msgPath stateMV
+    storeChan <- dupChan chan -- output channel to the central message store
+    -- Reconstruct the state
+    putStrLn "Reconstructing the State..."
+    msgs <- readMessages msgPath
+    state <- takeMVar stateMV
+    let newState = foldl update state msgs -- TODO foldr or strict foldl ?
+    putMVar stateMV newState
+    putStrLn $ "Computed State:" ++ show newState
+    -- keep connection to the Store
+    reconnectClient 1 firstTime storeHost storePort msgPath storeChan stateMV
 
 main :: IO ()
 main =
