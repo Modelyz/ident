@@ -10,11 +10,11 @@ import Data.Maybe qualified as Maybe
 import Data.Set as Set (Set, delete, empty, insert)
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
-import Data.UUID (UUID)
 import Data.UUID.V4 qualified as UUID (nextRandom)
 import Ident.Fragment (Fragment (..))
-import Message (Message (Message), Metadata (..), Payload (..), appendMessage, getFragments, metadata, payload, readMessages, setCreator, setFlow, setFragments)
+import Message (Message (Message), Payload (..), appendMessage, getFragments, metadata, payload, readMessages, setCreator, setFlow, setFragments)
 import MessageFlow (MessageFlow (..))
+import Metadata (Metadata (..), Origin (..))
 import Network.WebSockets (ConnectionException (..))
 import Network.WebSockets qualified as WS (ClientApp, DataMessage (..), fromLazyByteString, receiveDataMessage, runClient, sendTextData)
 import Options.Applicative qualified as Options
@@ -29,7 +29,7 @@ type Port = Int
 data State = State
     { lastNumbers :: Map.Map T.Text Int -- last identification number for each fragment name
     , pending :: Set Message
-    , uuids :: Set UUID
+    , uuids :: Set Metadata
     }
     deriving (Show)
 type StateMV = MVar State
@@ -75,7 +75,7 @@ clientApp msgPath storeChan stateMV conn = do
     -- send an initiatedConnection
     let initiatedConnection =
             Message
-                (Metadata{uuid = newUuid, Message.when = currentTime, from = "ident", flow = Requested})
+                (Metadata{uuid = newUuid, Metadata.when = currentTime, Metadata.from = Ident, Metadata.flow = Requested})
                 (InitiatedConnection (Connection{lastMessageTime = 0, Connection.uuids = Main.uuids state}))
     _ <- WS.sendTextData conn $ JSON.encode initiatedConnection
     -- Just reconnected, send the pending messages to the Store
@@ -84,16 +84,17 @@ clientApp msgPath storeChan stateMV conn = do
         putStrLn "Waiting for messages coming from the Store"
         Monad.forever $ do
             msg <- readChan storeChan -- here we get all messages from all browsers
-            Monad.when (from (metadata msg) == "front") $ do
+            Monad.when (from (metadata msg) == Front) $ do
                 case flow (metadata msg) of
                     Requested -> do
                         putStrLn $ "\nProcessing this msg coming from browser: " ++ show msg
                         st <- takeMVar stateMV
                         -- process
                         processedMsg <- processMessage stateMV msg
-                        putMVar stateMV $! update st msg
+                        putMVar stateMV $! foldl update st processedMsg
                         -- send to the Store
-                        WS.sendTextData conn $ JSON.encode processedMsg
+                        putStrLn $ "Send back this msg to the store: " ++ show processedMsg
+                        mapM_ (WS.sendTextData conn . JSON.encode) processedMsg
                     _ -> return ()
 
     -- CLIENT MAIN THREAD
@@ -111,7 +112,7 @@ clientApp msgPath storeChan stateMV conn = do
                 case flow (metadata msg) of
                     Requested -> do
                         st' <- readMVar stateMV
-                        Monad.when (from (metadata msg) == "front" && uuid (metadata msg) `notElem` Main.uuids st') $ do
+                        Monad.when (from (metadata msg) == Front && metadata msg `notElem` Main.uuids st') $ do
                             appendMessage msgPath msg
                             -- send msg to other connected clients
                             putStrLn "\nWriting to the chan"
@@ -121,10 +122,6 @@ clientApp msgPath storeChan stateMV conn = do
                             putMVar stateMV $! update st'' msg
                             putStrLn "updated state"
                     _ -> return ()
-
-                processedMsg <- processMessage stateMV msg
-                state' <- takeMVar stateMV
-                putMVar stateMV $! foldl update state' processedMsg
             Left err -> putStrLn $ "\nError decoding incoming message" ++ err
 
 update :: State -> Message -> State
@@ -135,7 +132,7 @@ update state msg =
             _ ->
                 state
                     { pending = Set.insert msg $ pending state
-                    , Main.uuids = Set.insert (uuid (metadata msg)) (Main.uuids state)
+                    , Main.uuids = Set.insert (metadata msg) (Main.uuids state)
                     }
         Processed -> state{pending = Set.delete msg $ pending state}
         Error _ -> state
@@ -161,17 +158,17 @@ processMessage stateMV msg = do
                         ([], state)
                         fragments
             putMVar stateMV $! update newState msg
-            putStrLn $ "\nnewseqMap = " ++ show newState
+            putStrLn $ "\nnewState = " ++ show newState
             -- build a ProcessedMsg with the computed sequences.
             -- We need to loop on the fragment and update those whose with the right name
             state' <- takeMVar stateMV
-            let processedMsg = setFlow Processed $ setFragments (reverse fragments') $ setCreator "ident" msg
+            let processedMsg = setFlow Processed $ setFragments (reverse fragments') $ setCreator Ident msg
             putMVar stateMV $! update state' processedMsg
             putStrLn $ "\nfragments: " ++ show fragments'
             return [processedMsg]
-        AddedIdentifierType _ -> return [setFlow Processed $ setCreator "ident" msg]
-        RemovedIdentifierType _ -> return [setFlow Processed $ setCreator "ident" msg]
-        ChangedIdentifierType _ _ -> return [setFlow Processed $ setCreator "ident" msg]
+        AddedIdentifierType _ -> return [setFlow Processed $ setCreator Ident msg]
+        RemovedIdentifierType _ -> return [setFlow Processed $ setCreator Ident msg]
+        ChangedIdentifierType _ _ -> return [setFlow Processed $ setCreator Ident msg]
         _ -> return []
 
 maxWait :: Int
