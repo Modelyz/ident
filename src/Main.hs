@@ -94,6 +94,7 @@ clientApp msgPath storeChan stateMV conn = do
                         putMVar stateMV $! foldl update st processedMsg
                         -- send to the Store
                         putStrLn $ "Send back this msg to the store: " ++ show processedMsg
+                        mapM_ (appendMessage msgPath) processedMsg
                         mapM_ (WS.sendTextData conn . JSON.encode) processedMsg
                     _ -> return ()
 
