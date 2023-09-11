@@ -3,13 +3,15 @@
 import Connection (Connection (..))
 import Control.Concurrent (Chan, MVar, dupChan, forkIO, newChan, newMVar, putMVar, readChan, readMVar, takeMVar, threadDelay, writeChan)
 import Control.Exception (AsyncException (..), Handler (..), SomeException (..), catches)
-import Control.Monad qualified as Monad (forever, when)
+import Control.Monad qualified as Monad (forever, unless, when)
 import Data.Aeson qualified as JSON (eitherDecode, encode)
+import Data.Map.Strict as Map (Map, delete, empty, insert)
 import Data.Map.Strict qualified as Map
 import Data.Maybe qualified as Maybe
-import Data.Set as Set (Set, delete, empty, insert)
+import Data.Set as Set (Set, empty, insert)
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
+import Data.UUID (UUID)
 import Data.UUID.V4 qualified as UUID (nextRandom)
 import Ident.Fragment (Fragment (..))
 import Message (Message (Message), Payload (..), appendMessage, getFragments, metadata, payload, readMessages, setCreator, setFlow, setFragments)
@@ -28,8 +30,9 @@ type Port = Int
 
 data State = State
     { lastNumbers :: Map.Map T.Text Int -- last identification number for each fragment name
-    , pending :: Set Message
+    , pending :: Map UUID Message
     , uuids :: Set Metadata
+    , syncing :: Bool
     }
     deriving (Show)
 type StateMV = MVar State
@@ -38,8 +41,9 @@ emptyState :: State
 emptyState =
     State
         { lastNumbers = Map.empty
-        , pending = Set.empty
+        , pending = Map.empty
         , Main.uuids = Set.empty
+        , syncing = True
         }
 
 options :: Options.Parser Options
@@ -80,6 +84,8 @@ clientApp msgPath storeChan stateMV conn = do
     _ <- WS.sendTextData conn $ JSON.encode initiatedConnection
     -- Just reconnected, send the pending messages to the Store
     mapM_ (WS.sendTextData conn . JSON.encode) (pending state)
+    -- fork a thread to send back data from the channel to the central store
+    -- CLIENT WORKER THREAD
     _ <- forkIO $ do
         putStrLn "Waiting for messages coming from the Store"
         Monad.forever $ do
@@ -100,8 +106,8 @@ clientApp msgPath storeChan stateMV conn = do
 
     -- CLIENT MAIN THREAD
     -- loop on the handling of messages incoming through websocket
-    putStrLn "Starting message handler"
     Monad.forever $ do
+        putStrLn "Waiting for messages coming from the store"
         message <- WS.receiveDataMessage conn
         putStrLn $ "\nReceived msg through websocket from the store: " ++ show message
         case JSON.eitherDecode
@@ -110,20 +116,36 @@ clientApp msgPath storeChan stateMV conn = do
                 WS.Binary bs -> WS.fromLazyByteString bs
             ) of
             Right msg -> do
+                st' <- readMVar stateMV
                 case flow (metadata msg) of
                     Requested -> do
-                        st' <- readMVar stateMV
                         Monad.when (from (metadata msg) == Front && metadata msg `notElem` Main.uuids st') $ do
                             appendMessage msgPath msg
-                            -- send msg to other connected clients
-                            putStrLn "\nWriting to the chan"
-                            writeChan storeChan msg
+                            -- send msg to the worker thread and to other connected clients
+                            Monad.unless (syncing st') $ do
+                                putStrLn "\nWriting to the chan"
+                                writeChan storeChan msg
                             -- Add it or remove to the pending list (if relevant) and keep the uuid
                             st'' <- takeMVar stateMV
                             putMVar stateMV $! update st'' msg
                             putStrLn "updated state"
+                    Processed -> do
+                        case payload msg of
+                            InitiatedConnection _ -> do
+                                st''' <- takeMVar stateMV
+                                putMVar stateMV $! st'''{syncing = False}
+                            _ -> do
+                                appendMessage msgPath msg
+                                -- send msg to the worker thread and to other connected clients
+                                Monad.unless (syncing st') $ do
+                                    putStrLn "\nWriting to the chan"
+                                    writeChan storeChan msg
+                                -- Add it or remove to the pending list (if relevant) and keep the uuid
+                                st'' <- takeMVar stateMV
+                                putMVar stateMV $! update st'' msg
+                                putStrLn "updated state"
                     _ -> return ()
-            Left err -> putStrLn $ "\nError decoding incoming message" ++ err
+            Left err -> putStrLn $ "\nError decoding incoming message: " ++ err
 
 update :: State -> Message -> State
 update state msg =
@@ -132,10 +154,14 @@ update state msg =
             InitiatedConnection _ -> state
             _ ->
                 state
-                    { pending = Set.insert msg $ pending state
+                    { pending = Map.insert (Metadata.uuid (metadata msg)) msg $ pending state
                     , Main.uuids = Set.insert (metadata msg) (Main.uuids state)
                     }
-        Processed -> state{pending = Set.delete msg $ pending state}
+        Processed ->
+            state
+                { pending = Map.delete (Metadata.uuid (metadata msg)) $ pending state
+                , Main.uuids = Set.insert (metadata msg) (Main.uuids state)
+                }
         Error _ -> state
 
 processMessage :: StateMV -> Message -> IO [Message]
