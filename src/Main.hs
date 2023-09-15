@@ -90,9 +90,9 @@ clientApp msgPath storeChan stateMV conn = do
         putStrLn "Waiting for messages coming from the Store"
         Monad.forever $ do
             msg <- readChan storeChan -- here we get all messages from all browsers
-            Monad.when (from (metadata msg) == Front) $ do
-                case flow (metadata msg) of
-                    Requested -> do
+            case flow (metadata msg) of
+                Requested -> case from (metadata msg) of
+                    Front -> do
                         putStrLn $ "\nProcessing this msg coming from browser: " ++ show msg
                         st <- takeMVar stateMV
                         -- process
@@ -103,6 +103,7 @@ clientApp msgPath storeChan stateMV conn = do
                         mapM_ (appendMessage msgPath) processedMsg
                         mapM_ (WS.sendTextData conn . JSON.encode) processedMsg
                     _ -> return ()
+                _ -> return ()
 
     -- CLIENT MAIN THREAD
     -- loop on the handling of messages incoming through websocket
@@ -118,8 +119,8 @@ clientApp msgPath storeChan stateMV conn = do
             Right msg -> do
                 st' <- readMVar stateMV
                 case flow (metadata msg) of
-                    Requested -> do
-                        Monad.when (from (metadata msg) == Front && metadata msg `notElem` Main.uuids st') $ do
+                    Requested -> case from (metadata msg) of
+                        Front -> Monad.when (metadata msg `notElem` Main.uuids st') $ do
                             appendMessage msgPath msg
                             -- send msg to the worker thread and to other connected clients
                             Monad.unless (syncing st') $ do
@@ -129,6 +130,7 @@ clientApp msgPath storeChan stateMV conn = do
                             st'' <- takeMVar stateMV
                             putMVar stateMV $! update st'' msg
                             putStrLn "updated state"
+                        _ -> return ()
                     Processed -> do
                         case payload msg of
                             InitiatedConnection _ -> do
