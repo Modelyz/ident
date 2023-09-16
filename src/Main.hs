@@ -11,11 +11,11 @@ import Data.Maybe qualified as Maybe
 import Data.Set as Set (Set, empty, insert)
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
-import Data.UUID (UUID)
 import Data.UUID.V4 qualified as UUID (nextRandom)
 import Ident.Fragment (Fragment (..))
-import Message (Message (Message), MessageId, Payload (..), appendMessage, creator, getFragments, messageId, metadata, payload, readMessages, setCreator, setFlow, setFragments, setVisited)
+import Message (Message (Message), Payload (..), appendMessage, creator, getFragments, metadata, payload, readMessages, setCreator, setFlow, setFragments, setVisited)
 import MessageFlow (MessageFlow (..))
+import MessageId (MessageId, messageId)
 import Metadata (Metadata (..), Origin (..))
 import Network.WebSockets (ConnectionException (..))
 import Network.WebSockets qualified as WS (ClientApp, DataMessage (..), fromLazyByteString, receiveDataMessage, runClient, sendTextData)
@@ -30,7 +30,7 @@ type Port = Int
 
 data State = State
     { lastNumbers :: Map.Map T.Text Int -- last identification number for each fragment name
-    , pending :: Map UUID Message
+    , pending :: Map MessageId Message
     , uuids :: Set MessageId
     , syncing :: Bool
     }
@@ -158,12 +158,12 @@ update state msg =
             InitiatedConnection _ -> state
             _ ->
                 state
-                    { pending = Map.insert (Metadata.uuid (metadata msg)) msg $ pending state
+                    { pending = Map.insert (messageId (metadata msg)) msg $ pending state
                     , Main.uuids = Set.insert (messageId $ metadata msg) (Main.uuids state)
                     }
         Processed ->
             state
-                { pending = Map.delete (Metadata.uuid (metadata msg)) $ pending state
+                { pending = Map.delete (messageId (metadata msg)) $ pending state
                 , Main.uuids = Set.insert (messageId $ metadata msg) (Main.uuids state)
                 }
         Error _ -> state
