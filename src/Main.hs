@@ -5,7 +5,6 @@ import Control.Concurrent (Chan, MVar, dupChan, forkIO, newChan, newMVar, putMVa
 import Control.Exception (AsyncException (..), Handler (..), SomeException (..), catches)
 import Control.Monad qualified as Monad (forever, unless, when)
 import Data.Aeson qualified as JSON (eitherDecode, encode)
-import Data.List qualified as List
 import Data.Map.Strict as Map (Map, delete, empty, insert)
 import Data.Map.Strict qualified as Map
 import Data.Maybe qualified as Maybe
@@ -80,7 +79,7 @@ clientApp msgPath storeChan stateMV conn = do
     -- send an initiatedConnection
     let initiatedConnection =
             Message
-                (Metadata{uuid = newUuid, Metadata.when = currentTime, Metadata.from = List.singleton Ident, Metadata.flow = Requested})
+                (Metadata{uuid = newUuid, Metadata.when = currentTime, Metadata.from = [Ident], Metadata.flow = Requested})
                 (InitiatedConnection (Connection{lastMessageTime = 0, Connection.uuids = Main.uuids state}))
     _ <- WS.sendTextData conn $ JSON.encode initiatedConnection
     -- Just reconnected, send the pending messages to the Store
@@ -95,9 +94,9 @@ clientApp msgPath storeChan stateMV conn = do
                 Requested -> case creator msg of
                     Front -> do
                         putStrLn $ "\nProcessing this msg coming from browser: " ++ show msg
-                        st <- takeMVar stateMV
                         -- process
                         processedMsg <- processMessage stateMV msg
+                        st <- takeMVar stateMV
                         putMVar stateMV $! foldl update st processedMsg
                         -- send to the Store
                         putStrLn $ "Send back this msg to the store: " ++ show processedMsg
@@ -124,31 +123,31 @@ clientApp msgPath storeChan stateMV conn = do
                         Front -> Monad.when (messageId (metadata msg) `notElem` Main.uuids st') $ do
                             let msg' = setVisited Ident msg
                             appendMessage msgPath msg'
-                            -- send msg to the worker thread and to other connected clients
-                            Monad.unless (syncing st') $ do
-                                putStrLn "\nWriting to the chan"
-                                writeChan storeChan msg'
                             -- Add it or remove to the pending list (if relevant) and keep the uuid
                             st'' <- takeMVar stateMV
                             putMVar stateMV $! update st'' msg'
                             putStrLn "updated state"
+                            -- send msg to the worker thread and to other connected clients
+                            Monad.unless (syncing st') $ do
+                                putStrLn "\nWriting to the chan"
+                                writeChan storeChan msg'
                         _ -> return ()
-                    Processed -> do
-                        case payload msg of
-                            InitiatedConnection _ -> do
-                                st''' <- takeMVar stateMV
-                                putMVar stateMV $! st'''{syncing = False}
-                            _ -> do
-                                let msg' = setVisited Ident msg
-                                appendMessage msgPath msg'
-                                -- send msg to the worker thread and to other connected clients
-                                Monad.unless (syncing st') $ do
-                                    putStrLn "\nWriting to the chan"
-                                    writeChan storeChan msg'
-                                -- Add it or remove to the pending list (if relevant) and keep the uuid
-                                st'' <- takeMVar stateMV
-                                putMVar stateMV $! update st'' msg'
-                                putStrLn "updated state"
+                    Processed -> case payload msg of
+                        InitiatedConnection _ -> do
+                            st''' <- takeMVar stateMV
+                            putMVar stateMV $! st'''{syncing = False}
+                            putStrLn "Left the syncing mode"
+                        _ -> Monad.when (messageId (metadata msg) `notElem` Main.uuids st') $ do
+                            let msg' = setVisited Ident msg
+                            appendMessage msgPath msg'
+                            -- Add it or remove to the pending list (if relevant) and keep the uuid
+                            st'' <- takeMVar stateMV
+                            putMVar stateMV $! update st'' msg'
+                            putStrLn "updated state"
+                            -- send msg to the worker thread and to other connected clients
+                            Monad.unless (syncing st') $ do
+                                putStrLn "\nWriting to the chan"
+                                writeChan storeChan msg'
                     _ -> return ()
             Left err -> putStrLn $ "\nError decoding incoming message: " ++ err
 
