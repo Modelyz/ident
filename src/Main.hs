@@ -13,7 +13,7 @@ import Data.Text qualified as T
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
 import Data.UUID.V4 qualified as UUID (nextRandom)
 import Ident.Fragment (Fragment (..))
-import Message (Message (Message), Payload (..), appendMessage, creator, getFragments, metadata, payload, readMessages, setCreator, setFlow, setFragments, setVisited)
+import Message (Message (Message), Payload (..), addVisited, appendMessage, creator, getFragments, metadata, payload, readMessages, setCreator, setFlow, setFragments)
 import MessageFlow (MessageFlow (..))
 import MessageId (MessageId, messageId)
 import Metadata (Metadata (..), Origin (..))
@@ -83,17 +83,16 @@ clientApp msgPath storeChan stateMV conn = do
                 (InitiatedConnection (Connection{lastMessageTime = 0, Connection.uuids = Main.uuids state}))
     _ <- WS.sendTextData conn $ JSON.encode initiatedConnection
     -- Just reconnected, send the pending messages to the Store
-    mapM_ (WS.sendTextData conn . JSON.encode) (pending state)
+    mapM_ (WS.sendTextData conn . JSON.encode . addVisited Ident) (pending state)
     -- fork a thread to send back data from the channel to the central store
     -- CLIENT WORKER THREAD
     _ <- forkIO $ do
-        putStrLn "Waiting for messages coming from the Store"
         Monad.forever $ do
             msg <- readChan storeChan -- here we get all messages from all browsers
+            putStrLn $ "CLIENT WORKER THREAD received the msg from browsers\n:" ++ show msg
             case flow (metadata msg) of
                 Requested -> case creator msg of
                     Front -> do
-                        putStrLn $ "\nProcessing this msg coming from browser: " ++ show msg
                         -- process
                         processedMsg <- processMessage stateMV msg
                         st <- takeMVar stateMV
@@ -108,9 +107,8 @@ clientApp msgPath storeChan stateMV conn = do
     -- CLIENT MAIN THREAD
     -- loop on the handling of messages incoming through websocket
     Monad.forever $ do
-        putStrLn "Waiting for messages coming from the store"
         message <- WS.receiveDataMessage conn
-        putStrLn $ "\nReceived msg through websocket from the store: " ++ show message
+        putStrLn $ "CLIENT MAIN THREAD received the msg from browsers\n:" ++ show message
         case JSON.eitherDecode
             ( case message of
                 WS.Text bs _ -> WS.fromLazyByteString bs
@@ -121,16 +119,15 @@ clientApp msgPath storeChan stateMV conn = do
                 case flow (metadata msg) of
                     Requested -> case creator msg of
                         Front -> Monad.when (messageId (metadata msg) `notElem` Main.uuids st') $ do
-                            let msg' = setVisited Ident msg
-                            appendMessage msgPath msg'
+                            appendMessage msgPath msg
                             -- Add it or remove to the pending list (if relevant) and keep the uuid
                             st'' <- takeMVar stateMV
-                            putMVar stateMV $! update st'' msg'
+                            putMVar stateMV $! update st'' msg
                             putStrLn "updated state"
                             -- send msg to the worker thread and to other connected clients
                             Monad.unless (syncing st') $ do
-                                putStrLn "\nWriting to the chan"
-                                writeChan storeChan msg'
+                                putStrLn "Writing to the chan"
+                                writeChan storeChan msg
                         _ -> return ()
                     Processed -> case payload msg of
                         InitiatedConnection _ -> do
@@ -138,18 +135,17 @@ clientApp msgPath storeChan stateMV conn = do
                             putMVar stateMV $! st'''{syncing = False}
                             putStrLn "Left the syncing mode"
                         _ -> Monad.when (messageId (metadata msg) `notElem` Main.uuids st') $ do
-                            let msg' = setVisited Ident msg
-                            appendMessage msgPath msg'
+                            appendMessage msgPath msg
                             -- Add it or remove to the pending list (if relevant) and keep the uuid
                             st'' <- takeMVar stateMV
-                            putMVar stateMV $! update st'' msg'
+                            putMVar stateMV $! update st'' msg
                             putStrLn "updated state"
                             -- send msg to the worker thread and to other connected clients
                             Monad.unless (syncing st') $ do
-                                putStrLn "\nWriting to the chan"
-                                writeChan storeChan msg'
+                                putStrLn "Writing to the chan"
+                                writeChan storeChan msg
                     _ -> return ()
-            Left err -> putStrLn $ "\nError decoding incoming message: " ++ err
+            Left err -> putStrLn $ "### ERROR ### decoding incoming message:\n" ++ err
 
 update :: State -> Message -> State
 update state msg =
@@ -172,8 +168,6 @@ processMessage :: StateMV -> Message -> IO [Message]
 processMessage stateMV msg = do
     case payload msg of
         AddedIdentifier _ -> do
-            -- store the ident messages in the local store
-            putStrLn $ "\nStored message: " ++ show msg
             state <- takeMVar stateMV
             -- read the fragments
             let fragments = getFragments msg
@@ -189,13 +183,13 @@ processMessage stateMV msg = do
                         ([], state)
                         fragments
             putMVar stateMV $! update newState msg
-            putStrLn $ "\nnewState = " ++ show newState
+            putStrLn $ "NEW STATE:\n" ++ show newState
             -- build a ProcessedMsg with the computed sequences.
             -- We need to loop on the fragment and update those whose with the right name
             state' <- takeMVar stateMV
             let processedMsg = setFlow Processed $ setFragments (reverse fragments') $ setCreator Ident msg
             putMVar stateMV $! update state' processedMsg
-            putStrLn $ "\nfragments: " ++ show fragments'
+            putStrLn $ "FRAGMENTS:\n" ++ show fragments'
             return [processedMsg]
         AddedIdentifierType _ -> return [setFlow Processed $ setCreator Ident msg]
         RemovedIdentifierType _ -> return [setFlow Processed $ setCreator Ident msg]
@@ -243,7 +237,7 @@ serve (Options msgPath storeHost storePort) = do
     state <- takeMVar stateMV
     let newState = foldl update state msgs -- TODO foldr or strict foldl ?
     putMVar stateMV newState
-    putStrLn $ "Computed State:" ++ show newState
+    putStrLn $ "STATE:\n" ++ show newState
     -- keep connection to the Store
     reconnectClient 1 firstTime storeHost storePort msgPath storeChan stateMV
 
