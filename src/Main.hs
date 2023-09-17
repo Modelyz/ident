@@ -89,18 +89,18 @@ clientApp msgPath storeChan stateMV conn = do
     _ <- forkIO $ do
         Monad.forever $ do
             msg <- readChan storeChan -- here we get all messages from all browsers
-            putStrLn $ "CLIENT WORKER THREAD received the msg from browsers\n:" ++ show msg
+            putStrLn $ "CLIENT WORKER THREAD received the msg from browsers:\n" ++ show msg
             case flow (metadata msg) of
                 Requested -> case creator msg of
                     Front -> do
                         -- process
-                        processedMsg <- processMessage stateMV msg
+                        processedMsgs <- processMessage stateMV msg
                         st <- takeMVar stateMV
-                        putMVar stateMV $! foldl update st processedMsg
+                        putMVar stateMV $! foldl update st processedMsgs
                         -- send to the Store
-                        putStrLn $ "Send back this msg to the store: " ++ show processedMsg
-                        mapM_ (appendMessage msgPath) processedMsg
-                        mapM_ (WS.sendTextData conn . JSON.encode) processedMsg
+                        mapM_ (appendMessage msgPath) processedMsgs
+                        mapM_ (WS.sendTextData conn . JSON.encode) processedMsgs
+                        putStrLn $ "Sent back this msg to the store: " ++ show processedMsgs
                     _ -> return ()
                 _ -> return ()
 
@@ -108,7 +108,7 @@ clientApp msgPath storeChan stateMV conn = do
     -- loop on the handling of messages incoming through websocket
     Monad.forever $ do
         message <- WS.receiveDataMessage conn
-        putStrLn $ "CLIENT MAIN THREAD received the msg from browsers\n:" ++ show message
+        putStrLn $ "CLIENT MAIN THREAD received the msg from browsers:\n" ++ show message
         case JSON.eitherDecode
             ( case message of
                 WS.Text bs _ -> WS.fromLazyByteString bs
