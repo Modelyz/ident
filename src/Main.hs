@@ -16,10 +16,11 @@ import Ident.Fragment (Fragment (..))
 import Message (Message (Message), Payload (..), addVisited, appendMessage, creator, getFragments, metadata, payload, readMessages, setCreator, setFlow, setFragments)
 import MessageFlow (MessageFlow (..))
 import MessageId (MessageId, messageId)
-import Metadata (Metadata (..), Origin (..))
+import Metadata (Metadata (..))
 import Network.WebSockets (ConnectionException (..))
 import Network.WebSockets qualified as WS (ClientApp, DataMessage (..), fromLazyByteString, receiveDataMessage, runClient, sendTextData)
 import Options.Applicative qualified as Options
+import Service (Service (..))
 import System.Exit (exitSuccess)
 
 -- dir, port, file
@@ -36,6 +37,9 @@ data State = State
     }
     deriving (Show)
 type StateMV = MVar State
+
+myself :: Service
+myself = Ident
 
 emptyState :: State
 emptyState =
@@ -79,11 +83,11 @@ clientApp msgPath storeChan stateMV conn = do
     -- send an initiatedConnection
     let initiatedConnection =
             Message
-                (Metadata{uuid = newUuid, Metadata.when = currentTime, Metadata.from = [Ident], Metadata.flow = Requested})
+                (Metadata{uuid = newUuid, Metadata.when = currentTime, Metadata.from = [myself], Metadata.flow = Requested})
                 (InitiatedConnection (Connection{lastMessageTime = 0, Connection.uuids = Main.uuids state}))
     _ <- WS.sendTextData conn $ JSON.encode initiatedConnection
     -- Just reconnected, send the pending messages to the Store
-    mapM_ (WS.sendTextData conn . JSON.encode . addVisited Ident) (pending state)
+    mapM_ (WS.sendTextData conn . JSON.encode . addVisited myself) (pending state)
     -- fork a thread to send back data from the channel to the central store
     -- CLIENT WORKER THREAD
     _ <- forkIO $ do
@@ -187,12 +191,12 @@ processMessage stateMV msg = do
             -- build a ProcessedMsg with the computed sequences.
             -- We need to loop on the fragment and update those whose with the right name
             state' <- takeMVar stateMV
-            let processedMsg = setFlow Processed $ setFragments (reverse fragments') $ setCreator Ident msg
+            let processedMsg = setFlow Processed $ setFragments (reverse fragments') $ setCreator myself msg
             putMVar stateMV $! update state' processedMsg
             putStrLn $ "FRAGMENTS:\n" ++ show fragments'
             return [processedMsg]
-        AddedIdentifierType _ -> return [setFlow Processed $ setCreator Ident msg]
-        RemovedIdentifierType _ -> return [setFlow Processed $ setCreator Ident msg]
+        AddedIdentifierType _ -> return [setFlow Processed $ setCreator myself msg]
+        RemovedIdentifierType _ -> return [setFlow Processed $ setCreator myself msg]
         ChangedIdentifierType _ _ -> return [setFlow Processed $ setCreator Ident msg]
         _ -> return []
 
