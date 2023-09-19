@@ -25,18 +25,18 @@ executable ident
     build-depends:
         base ^>= 4.16.0.0
         , aeson ^>= 2.1
-        , bytestring
+--        , bytestring
         , containers
-        , http-types
+--        , http-types
         , modelyz-message
-        , mtl
+--        , mtl
         , optparse-applicative
-        , scientific
+--        , scientific
         , text
         , time
-        , unordered-containers
+--        , unordered-containers
         , uuid
-        , vector
+--        , vector
         , wai
         , wai-websockets
         , warp

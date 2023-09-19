@@ -13,13 +13,14 @@ import Data.Text qualified as T
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
 import Data.UUID.V4 qualified as UUID (nextRandom)
 import Ident.Fragment (Fragment (..))
-import Message (Message (Message), Payload (..), addVisited, appendMessage, creator, getFragments, metadata, payload, readMessages, setCreator, setFlow, setFragments)
+import Message (Message (Message), addVisited, appendMessage, creator, getFragments, messageId, metadata, payload, readMessages, setCreator, setFlow, setFragments)
 import MessageFlow (MessageFlow (..))
-import MessageId (MessageId, messageId)
+import MessageId (MessageId)
 import Metadata (Metadata (..))
 import Network.WebSockets (ConnectionException (..))
 import Network.WebSockets qualified as WS (ClientApp, DataMessage (..), fromLazyByteString, receiveDataMessage, runClient, sendTextData)
 import Options.Applicative qualified as Options
+import Payload (Payload (..))
 import Service (Service (..))
 import System.Exit (exitSuccess)
 
@@ -122,7 +123,7 @@ clientApp msgPath storeChan stateMV conn = do
                 st' <- readMVar stateMV
                 case flow (metadata msg) of
                     Requested -> case creator msg of
-                        Front -> Monad.when (messageId (metadata msg) `notElem` Main.uuids st') $ do
+                        Front -> Monad.when (messageId msg `notElem` Main.uuids st') $ do
                             appendMessage msgPath msg
                             -- Add it or remove to the pending list (if relevant) and keep the uuid
                             st'' <- takeMVar stateMV
@@ -138,7 +139,7 @@ clientApp msgPath storeChan stateMV conn = do
                             st''' <- takeMVar stateMV
                             putMVar stateMV $! st'''{syncing = False}
                             putStrLn "Left the syncing mode"
-                        _ -> Monad.when (messageId (metadata msg) `notElem` Main.uuids st') $ do
+                        _ -> Monad.when (messageId msg `notElem` Main.uuids st') $ do
                             appendMessage msgPath msg
                             -- Add it or remove to the pending list (if relevant) and keep the uuid
                             st'' <- takeMVar stateMV
@@ -158,13 +159,13 @@ update state msg =
             InitiatedConnection _ -> state
             _ ->
                 state
-                    { pending = Map.insert (messageId (metadata msg)) msg $ pending state
-                    , Main.uuids = Set.insert (messageId $ metadata msg) (Main.uuids state)
+                    { pending = Map.insert (messageId msg) msg $ pending state
+                    , Main.uuids = Set.insert (messageId msg) (Main.uuids state)
                     }
         Processed ->
             state
-                { pending = Map.delete (messageId (metadata msg)) $ pending state
-                , Main.uuids = Set.insert (messageId $ metadata msg) (Main.uuids state)
+                { pending = Map.delete (messageId msg) $ pending state
+                , Main.uuids = Set.insert (messageId msg) (Main.uuids state)
                 }
         Error _ -> state
 
@@ -197,7 +198,7 @@ processMessage stateMV msg = do
             return [processedMsg]
         AddedIdentifierType _ -> return [setFlow Processed $ setCreator myself msg]
         RemovedIdentifierType _ -> return [setFlow Processed $ setCreator myself msg]
-        ChangedIdentifierType _ _ -> return [setFlow Processed $ setCreator Ident msg]
+        ChangedIdentifierType _ _ -> return [setFlow Processed $ setCreator myself msg]
         _ -> return []
 
 maxWait :: Int
