@@ -91,8 +91,8 @@ clientApp msgPath storeChan stateMV conn = do
     -- CLIENT WORKER THREAD
     _ <- forkIO $ do
         Monad.forever $ do
-            msg <- readChan storeChan -- here we get all messages from all browsers
-            putStrLn $ "CLIENT WORKER THREAD received the msg from browsers:\n" ++ show msg
+            msg <- readChan storeChan -- here we get all messages
+            putStrLn $ "CLIENT WORKER THREAD received this msg from the chan:\n" ++ show msg
             case flow (metadata msg) of
                 Requested -> case creator msg of
                     Front -> do
@@ -101,9 +101,9 @@ clientApp msgPath storeChan stateMV conn = do
                         st <- takeMVar stateMV
                         putMVar stateMV $! foldl update st processedMsgs
                         -- send to the Store
-                        mapM_ (appendMessage msgPath) processedMsgs
                         mapM_ (WS.sendTextData conn . JSON.encode) processedMsgs
                         putStrLn $ "Sent back this msg to the store: " ++ show processedMsgs
+                        mapM_ (appendMessage msgPath) processedMsgs
                     _ -> return ()
                 _ -> return ()
 
@@ -111,7 +111,7 @@ clientApp msgPath storeChan stateMV conn = do
     -- loop on the handling of messages incoming through websocket
     Monad.forever $ do
         message <- WS.receiveDataMessage conn
-        putStrLn $ "CLIENT MAIN THREAD received the msg from browsers:\n" ++ show message
+        putStrLn $ "CLIENT MAIN THREAD received the msg from Store:\n" ++ show message
         case JSON.eitherDecode
             ( case message of
                 WS.Text bs _ -> WS.fromLazyByteString bs
@@ -173,7 +173,7 @@ processMessage stateMV msg = do
             state <- takeMVar stateMV
             -- read the fragments
             let fragments = getFragments msg
-            print fragments
+            putStrLn $ "FRAGMENTS" ++ show fragments
             let (fragments', newState) =
                     foldl
                         ( \(frags, st) fragment -> case fragment of
