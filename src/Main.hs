@@ -3,7 +3,7 @@
 import Connection (Connection (..))
 import Control.Concurrent (Chan, MVar, dupChan, forkIO, newChan, newMVar, putMVar, readChan, readMVar, takeMVar, threadDelay, writeChan)
 import Control.Exception (AsyncException (..), Handler (..), SomeException (..), catches)
-import Control.Monad qualified as Monad (forever, unless, when)
+import Control.Monad qualified as Monad (forever, when)
 import Data.Aeson qualified as JSON (eitherDecode, encode)
 import Data.Map.Strict as Map (Map, delete, empty, insert)
 import Data.Map.Strict qualified as Map
@@ -13,7 +13,7 @@ import Data.Text qualified as T
 import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
 import Data.UUID.V4 qualified as UUID (nextRandom)
 import Ident.Fragment (Fragment (..))
-import Message (Message (Message), addVisited, appendMessage, creator, getFragments, messageId, metadata, payload, readMessages, setCreator, setFlow, setFragments)
+import Message (Message (Message), appendMessage, creator, getFragments, messageId, metadata, payload, readMessages, setCreator, setFlow, setFragments)
 import MessageFlow (MessageFlow (..))
 import MessageId (MessageId)
 import Metadata (Metadata (..))
@@ -34,7 +34,7 @@ data State = State
     { lastNumbers :: Map.Map T.Text Int -- last identification number for each fragment name
     , pending :: Map MessageId Message
     , uuids :: Set MessageId
-    , syncing :: Bool
+    , session :: Bool
     }
     deriving (Show)
 type StateMV = MVar State
@@ -48,7 +48,7 @@ emptyState =
         { lastNumbers = Map.empty
         , pending = Map.empty
         , Main.uuids = Set.empty
-        , syncing = True
+        , session = False
         }
 
 options :: Options.Parser Options
@@ -87,8 +87,6 @@ clientApp msgPath storeChan stateMV conn = do
                 (Metadata{uuid = newUuid, Metadata.when = currentTime, Metadata.from = [myself], Metadata.flow = Requested})
                 (InitiatedConnection (Connection{lastMessageTime = 0, Connection.uuids = Main.uuids state}))
     _ <- WS.sendTextData conn $ JSON.encode initiatedConnection
-    -- Just reconnected, send the pending messages to the Store
-    mapM_ (WS.sendTextData conn . JSON.encode . addVisited myself) (pending state)
     -- fork a thread to send back data from the channel to the central store
     -- CLIENT WORKER THREAD
     _ <- forkIO $ do
@@ -130,15 +128,14 @@ clientApp msgPath storeChan stateMV conn = do
                             putMVar stateMV $! update st'' msg
                             putStrLn "updated state"
                             -- send msg to the worker thread and to other connected clients
-                            Monad.unless (syncing st') $ do
-                                putStrLn "Writing to the chan"
-                                writeChan storeChan msg
+                            putStrLn "Writing to the chan"
+                            writeChan storeChan msg
                         _ -> return ()
                     Processed -> case payload msg of
                         InitiatedConnection _ -> do
                             st''' <- takeMVar stateMV
-                            putMVar stateMV $! st'''{syncing = False}
-                            putStrLn "Left the syncing mode"
+                            putMVar stateMV $! st'''{session = True}
+                            putStrLn "Got authorization from Store" -- still fake
                         _ -> Monad.when (messageId msg `notElem` Main.uuids st') $ do
                             appendMessage msgPath msg
                             -- Add it or remove to the pending list (if relevant) and keep the uuid
@@ -146,9 +143,8 @@ clientApp msgPath storeChan stateMV conn = do
                             putMVar stateMV $! update st'' msg
                             putStrLn "updated state"
                             -- send msg to the worker thread and to other connected clients
-                            Monad.unless (syncing st') $ do
-                                putStrLn "Writing to the chan"
-                                writeChan storeChan msg
+                            putStrLn "Writing to the chan"
+                            writeChan storeChan msg
                     _ -> return ()
             Left err -> putStrLn $ "### ERROR ### decoding incoming message:\n" ++ err
 
@@ -166,6 +162,7 @@ update state msg =
             state
                 { pending = Map.delete (messageId msg) $ pending state
                 , Main.uuids = Set.insert (messageId msg) (Main.uuids state)
+                -- , lastNumbers = Set.insert name Maybe.fromMaybe start (Map.lookup name (lastNumbers st))
                 }
         Error _ -> state
 
